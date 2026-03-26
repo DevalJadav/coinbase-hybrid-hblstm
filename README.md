@@ -90,7 +90,7 @@ Example performance (BTC-USD, 15-minute timeframe):
 
 Predicted vs Actual price comparison:
 
-![Prediction vs Actual](results/plot.png)
+![Prediction vs Actual](evidence_output/plots/15m__BTC-USD__v3b.png)
 
 ---
 
