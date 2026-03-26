@@ -122,3 +122,4 @@ Each version is evaluated in a live-like environment using rolling predictions.
 ```bash
 pip install -r requirements.txt
 python app.py
+streamlit run app.py -- --dashboard
