@@ -1,0 +1,20 @@
+# Virtual environment
+.venv/
+__pycache__/
+
+# Model checkpoints (ALL versions)
+checkpoints_*/
+
+
+# Data folders
+data_raw/
+data_out_*/
+corepaper/
+
+# Logs / temp
+*.log
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db
