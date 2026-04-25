@@ -1,8 +1,14 @@
+# app.py  (RUNS V1 + V2 + V3 + V3A + V3B across 15m + 30m + 1h)
+# V1, V2, V3, V3A are frozen.
+# V3B is the new hard-architecture comparison:
+#   same features as V3, same target/scaling pipeline,
+#   architecture only changed to single Bi-H.BLSTM + temporal attention.
+
 import argparse
 import os
 import time
 from datetime import datetime, timezone
-from typing import Optional
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -14,7 +20,6 @@ from model import (
     CFG_V3,
     CFG_V3A,
     CFG_V3B,
-    CFG_V4,
     load_bundle,
     online_update,
     predict_next,
@@ -35,16 +40,7 @@ DAILY_RETRAIN_HOURS = 24
 # Base wake-up interval = 15 minutes
 BASE_ALIGN_SECONDS = 15 * 60
 
-# Give each timeframe a short grace window so Coinbase has time
-# to publish the newly completed candle after the boundary.
-TF_FETCH_GRACE_SECONDS = {
-    "15m": 20,
-    "30m": 80,
-    "1h": 80,
-}
-TF_FETCH_RETRY_SLEEP = 4
-
-# Timeframes to run in parallel (direct Coinbase fetches)
+# Timeframes to run in parallel
 TIMEFRAMES = {
     "15m": {
         "granularity": "FIFTEEN_MINUTE",
@@ -75,7 +71,6 @@ OUT_ROOTS = {
     "v3": "data_out_v3",
     "v3a": "data_out_v3a",
     "v3b": "data_out_v3b",
-    "v4": "data_out_v4",
 }
 CKPT_ROOTS = {
     "v1": "checkpoints_v1",
@@ -83,7 +78,6 @@ CKPT_ROOTS = {
     "v3": "checkpoints_v3",
     "v3a": "checkpoints_v3a",
     "v3b": "checkpoints_v3b",
-    "v4": "checkpoints_v4",
 }
 
 CONFIGS = {
@@ -92,9 +86,36 @@ CONFIGS = {
     "v3": CFG_V3,
     "v3a": CFG_V3A,
     "v3b": CFG_V3B,
-    "v4": CFG_V4,
 }
-VERSIONS_ORDER = ["v1", "v2", "v3", "v3a", "v3b", "v4"]
+VERSIONS_ORDER = ["v1", "v2", "v3", "v3a", "v3b"]
+
+
+# =========================
+# Timezone policy
+# Keep all internal scheduling, storage, and joins in UTC.
+# Only logs / dashboard presentation are shown in Europe/London.
+# =========================
+DISPLAY_TZ = ZoneInfo("Europe/London")
+
+
+def now_utc():
+    return datetime.now(timezone.utc)
+
+
+def now_local() -> datetime:
+    return now_utc().astimezone(DISPLAY_TZ)
+
+
+def fmt_local(ts) -> str:
+    if ts is None:
+        return ""
+    return pd.to_datetime(ts, utc=True).tz_convert(DISPLAY_TZ).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def fmt_dual(ts) -> str:
+    ts_utc = pd.to_datetime(ts, utc=True)
+    ts_local = ts_utc.tz_convert(DISPLAY_TZ)
+    return f"{ts_local.strftime('%Y-%m-%d %H:%M:%S %Z')} | {ts_utc.isoformat()}"
 
 
 # =========================
@@ -142,23 +163,17 @@ def append_log(ver: str, tf_name: str, pid: str, line: str):
 # Safe CSV append
 # =========================
 CSV_COLUMNS = [
-    "time",          # source candle start time
-    "target_time",   # next candle start time
+    "time",
     "last_close",
     "pred_next_close",
     "pred_next_close_raw",
     "pi95_lower",
     "pi95_upper",
     "naive_next_close",
-    "current_regime",
-    "realized_vol",
-    "vol_ratio",
-    "gate_fast_weight",
-    "online_mode",
 ]
 
 
-def _read_last_time_csv(csv_path: str) -> Optional[str]:
+def _read_last_time_csv(csv_path: str) -> str | None:
     if not os.path.exists(csv_path):
         return None
     try:
@@ -181,22 +196,15 @@ def append_prediction(
     tf_name: str,
     pid: str,
     ts,
-    target_ts,
     last_close: float,
     pred_close: float,
     pred_raw: float,
     pi_lo: float,
     pi_hi: float,
     naive_close: float,
-    current_regime: str | None = None,
-    realized_vol: float | None = None,
-    vol_ratio: float | None = None,
-    gate_fast_weight: float | None = None,
-    online_mode: str | None = None,
 ):
     outp = out_pred_path(ver, tf_name, pid)
     ts_iso = pd.to_datetime(ts, utc=True).isoformat()
-    target_iso = pd.to_datetime(target_ts, utc=True).isoformat()
 
     last_ts = _read_last_time_csv(outp)
     if last_ts is not None and last_ts == ts_iso:
@@ -205,18 +213,12 @@ def append_prediction(
     row = pd.DataFrame([
         {
             "time": ts_iso,
-            "target_time": target_iso,
             "last_close": float(last_close),
             "pred_next_close": float(pred_close),
             "pred_next_close_raw": float(pred_raw),
             "pi95_lower": float(pi_lo),
             "pi95_upper": float(pi_hi),
             "naive_next_close": float(naive_close),
-            "current_regime": current_regime if current_regime is not None else "",
-            "realized_vol": float(realized_vol) if realized_vol is not None and np.isfinite(realized_vol) else np.nan,
-            "vol_ratio": float(vol_ratio) if vol_ratio is not None and np.isfinite(vol_ratio) else np.nan,
-            "gate_fast_weight": float(gate_fast_weight) if gate_fast_weight is not None and np.isfinite(gate_fast_weight) else np.nan,
-            "online_mode": online_mode if online_mode is not None else "",
         }
     ])
 
@@ -235,58 +237,54 @@ def append_prediction(
 
 
 # =========================
-# Time alignment / readiness
+# Time alignment
 # =========================
 def align_to_next_15m():
-    now = datetime.now(timezone.utc)
+    now = now_utc()
     next_epoch = ((int(now.timestamp()) // BASE_ALIGN_SECONDS) + 1) * BASE_ALIGN_SECONDS
-    nxt = datetime.fromtimestamp(next_epoch + 5, tz=timezone.utc)
+    nxt = datetime.fromtimestamp(next_epoch + 5, tz=timezone.utc)  # +5 seconds buffer
     time.sleep(max(0.0, (nxt - now).total_seconds()))
 
 
-def timeframe_due(tf_name: str, now_utc: datetime) -> bool:
-    step = TIMEFRAMES[tf_name]["seconds"]
-    offset = int(now_utc.timestamp()) % step
-    return offset <= 90
+# =========================
+# Data load/bootstrap
+# =========================
+def load_or_bootstrap(tf_name: str, pid: str) -> pd.DataFrame:
+    path = raw_path(tf_name, pid)
+    if os.path.exists(path):
+        df = pd.read_parquet(path)
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        window = TIMEFRAMES[tf_name]["window"]
+        if len(df) > window:
+            df = df.iloc[-window:].reset_index(drop=True)
+        return df
+
+    df = bootstrap_last_n_public(
+        pid,
+        n=TIMEFRAMES[tf_name]["window"],
+        granularity=TIMEFRAMES[tf_name]["granularity"],
+    )
+    df["time"] = pd.to_datetime(df["time"], utc=True)
+    df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+    df.to_parquet(path, index=False)
+    return df
 
 
-# =========================
-# Data helpers
-# =========================
 def save_buffer(tf_name: str, pid: str, df: pd.DataFrame):
     df.to_parquet(raw_path(tf_name, pid), index=False)
 
 
-def load_existing_parquet(path: str) -> Optional[pd.DataFrame]:
-    if not os.path.exists(path):
-        return None
-    df = pd.read_parquet(path)
-    if "time" not in df.columns:
-        return None
-    df["time"] = pd.to_datetime(df["time"], utc=True)
-    return df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-
-
-def filter_completed_candles(df: pd.DataFrame, tf_name: str, now_utc: Optional[datetime] = None) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    if now_utc is None:
-        now_utc = datetime.now(timezone.utc)
-    step = TIMEFRAMES[tf_name]["seconds"]
-    cutoff = pd.Timestamp(now_utc) - pd.Timedelta(seconds=step)
-    out = df.copy()
-    out["time"] = pd.to_datetime(out["time"], utc=True)
-    out = out[out["time"] <= cutoff]
-    out = out.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    return out
-
-
+# =========================
+# Continuity fix
+# =========================
 def ensure_continuity(tf_name: str, pid: str, df_buf: pd.DataFrame) -> pd.DataFrame:
     if df_buf is None or len(df_buf) < 10:
         return df_buf
 
     step = TIMEFRAMES[tf_name]["seconds"]
     gap_threshold = int(step * 1.2)
+
     df_buf = df_buf.sort_values("time").drop_duplicates("time").reset_index(drop=True)
     tail = df_buf["time"].iloc[-10:].reset_index(drop=True)
     dt = tail.diff().dt.total_seconds().fillna(step)
@@ -294,84 +292,14 @@ def ensure_continuity(tf_name: str, pid: str, df_buf: pd.DataFrame) -> pd.DataFr
     if (dt > gap_threshold).any():
         backfill = bootstrap_last_n_public(
             pid,
-            n=min(TIMEFRAMES[tf_name]["window"], 2000),
+            n=200,
             granularity=TIMEFRAMES[tf_name]["granularity"],
         )
         backfill["time"] = pd.to_datetime(backfill["time"], utc=True)
-        backfill = filter_completed_candles(backfill, tf_name)
         df_buf = merge_roll(df_buf, backfill, keep_last=TIMEFRAMES[tf_name]["window"])
         df_buf = df_buf.sort_values("time").drop_duplicates("time").reset_index(drop=True)
 
-    if len(df_buf) > TIMEFRAMES[tf_name]["window"]:
-        df_buf = df_buf.iloc[-TIMEFRAMES[tf_name]["window"]:].reset_index(drop=True)
-
     return df_buf
-
-
-def load_or_bootstrap(tf_name: str, pid: str) -> pd.DataFrame:
-    existing = load_existing_parquet(raw_path(tf_name, pid))
-    if existing is not None and len(existing) >= 100:
-        df = existing.copy()
-    else:
-        df = bootstrap_last_n_public(
-            pid,
-            n=TIMEFRAMES[tf_name]["window"],
-            granularity=TIMEFRAMES[tf_name]["granularity"],
-        )
-        df["time"] = pd.to_datetime(df["time"], utc=True)
-
-    df = filter_completed_candles(df, tf_name)
-    df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
-    df = ensure_continuity(tf_name, pid, df)
-    save_buffer(tf_name, pid, df)
-    return df
-
-
-def fetch_latest_until_deadline(pid: str, tf_name: str, prev_last_time, deadline_ts: float) -> pd.DataFrame:
-    latest_nonempty = pd.DataFrame()
-    granularity = TIMEFRAMES[tf_name]["granularity"]
-
-    while True:
-        latest = fetch_latest_public(pid, limit=200, granularity=granularity)
-        if not latest.empty:
-            latest["time"] = pd.to_datetime(latest["time"], utc=True)
-            latest = filter_completed_candles(latest, tf_name)
-            latest_nonempty = latest
-
-            if prev_last_time is None:
-                return latest
-            if not latest.empty and (latest["time"] > prev_last_time).any():
-                return latest
-
-        if time.time() >= deadline_ts:
-            return latest_nonempty
-        time.sleep(TF_FETCH_RETRY_SLEEP)
-
-
-def read_last_pred_time_any(tf_name: str, pid: str) -> Optional[pd.Timestamp]:
-    times = []
-    for ver in VERSIONS_ORDER:
-        path = out_pred_path(ver, tf_name, pid)
-        if not os.path.exists(path):
-            continue
-        try:
-            df = pd.read_csv(path, usecols=["time"])
-            if not df.empty:
-                times.append(pd.to_datetime(df["time"].iloc[-1], utc=True))
-        except Exception:
-            continue
-    if not times:
-        return None
-    return max(times)
-
-
-def init_last_processed_time(tf_name: str, pid: str, df_tf: pd.DataFrame) -> Optional[pd.Timestamp]:
-    last_pred = read_last_pred_time_any(tf_name, pid)
-    if last_pred is not None:
-        return last_pred
-    if df_tf is not None and not df_tf.empty:
-        return pd.to_datetime(df_tf["time"].iloc[-1], utc=True)
-    return None
 
 
 # =========================
@@ -385,15 +313,13 @@ def run_live():
 
     print(
         f"[INFO] Device={device} | Assets={PRODUCT_IDS} | "
-        f"Timeframes={list(TIMEFRAMES.keys())} | Versions={list(CONFIGS.keys())}"
+        f"Timeframes={list(TIMEFRAMES.keys())} | Versions={list(CONFIGS.keys())} | DisplayTZ=Europe/London | InternalTZ=UTC"
     )
-    print("[INFO] All timeframes are fetched directly from Coinbase. Only fully completed candles are processed.")
 
     buffers = {tf_name: {pid: None for pid in PRODUCT_IDS} for tf_name in TIMEFRAMES}
     bundles = {tf_name: {pid: {} for pid in PRODUCT_IDS} for tf_name in TIMEFRAMES}
-    last_processed = {tf_name: {pid: None for pid in PRODUCT_IDS} for tf_name in TIMEFRAMES}
     last_daily_retrain = {
-        tf_name: {pid: datetime.now(timezone.utc) for pid in PRODUCT_IDS}
+        tf_name: {pid: now_utc() for pid in PRODUCT_IDS}
         for tf_name in TIMEFRAMES
     }
     pred_counter = {
@@ -412,8 +338,8 @@ def run_live():
     for tf_name in TIMEFRAMES:
         for pid in PRODUCT_IDS:
             df_buf = load_or_bootstrap(tf_name, pid)
+            df_buf = ensure_continuity(tf_name, pid, df_buf)
             buffers[tf_name][pid] = df_buf
-            last_processed[tf_name][pid] = init_last_processed_time(tf_name, pid, df_buf)
             print(f"[INFO] {tf_name} | {pid} buffer candles = {len(df_buf)}")
 
             for ver in VERSIONS_ORDER:
@@ -436,7 +362,7 @@ def run_live():
                             "version": ver,
                             "window": TIMEFRAMES[tf_name]["window"],
                             "is_multi": IS_MULTI,
-                            "timestamp_utc": str(datetime.now(timezone.utc)),
+                            "timestamp_utc": str(now_utc()),
                             "mode": "startup_train",
                             "cfg": cfg.__dict__,
                         },
@@ -444,59 +370,46 @@ def run_live():
                 else:
                     print(f"[INFO] [{tf_name}][{pid}] Loaded checkpoint for {ver}.")
                 bundles[tf_name][pid][ver] = bundle
-                append_log(ver, tf_name, pid, f"{datetime.now(timezone.utc)} STARTUP ready | candles={len(df_buf)}")
+                append_log(ver, tf_name, pid, f"{now_utc()} STARTUP ready | candles={len(df_buf)}")
 
     # Loop
     while True:
         align_to_next_15m()
-        loop_now = datetime.now(timezone.utc)
 
         for tf_name in TIMEFRAMES:
-            if tf_name != "15m" and not timeframe_due(tf_name, loop_now):
-                continue
-
+            granularity = TIMEFRAMES[tf_name]["granularity"]
             window = TIMEFRAMES[tf_name]["window"]
-            step_seconds = TIMEFRAMES[tf_name]["seconds"]
-            fetch_deadline = time.time() + TF_FETCH_GRACE_SECONDS.get(tf_name, 20)
 
             for pid in PRODUCT_IDS:
                 try:
-                    prev_last_time = (
-                        buffers[tf_name][pid]["time"].iloc[-1]
-                        if buffers[tf_name][pid] is not None and not buffers[tf_name][pid].empty
-                        else None
-                    )
+                    prev_last_time = buffers[tf_name][pid]["time"].iloc[-1] if not buffers[tf_name][pid].empty else None
 
-                    latest = fetch_latest_until_deadline(
-                        pid=pid,
-                        tf_name=tf_name,
-                        prev_last_time=prev_last_time,
-                        deadline_ts=fetch_deadline,
+                    latest = fetch_latest_public(
+                        pid,
+                        limit=200,
+                        granularity=granularity,
                     )
                     if latest.empty:
                         for ver in CONFIGS:
-                            append_log(ver, tf_name, pid, f"{datetime.now(timezone.utc)} WARN no latest completed candles")
+                            append_log(ver, tf_name, pid, f"{now_utc()} WARN no latest candles")
                         continue
 
+                    latest["time"] = pd.to_datetime(latest["time"], utc=True)
                     buffers[tf_name][pid] = merge_roll(buffers[tf_name][pid], latest, keep_last=window)
-                    buffers[tf_name][pid] = buffers[tf_name][pid].sort_values("time").drop_duplicates("time").reset_index(drop=True)
                     buffers[tf_name][pid] = ensure_continuity(tf_name, pid, buffers[tf_name][pid])
                     save_buffer(tf_name, pid, buffers[tf_name][pid])
 
-                    last_done = last_processed[tf_name][pid]
-                    if last_done is None:
-                        last_processed[tf_name][pid] = pd.to_datetime(buffers[tf_name][pid]["time"].iloc[-1], utc=True)
-                        continue
-
-                    new_rows = buffers[tf_name][pid][buffers[tf_name][pid]["time"] > pd.to_datetime(last_done, utc=True)]
-                    if new_rows.empty:
-                        continue
-                    new_idx = new_rows.index.tolist()
+                    if prev_last_time is None:
+                        new_idx = list(range(len(buffers[tf_name][pid])))
+                    else:
+                        new_rows = buffers[tf_name][pid][buffers[tf_name][pid]["time"] > prev_last_time]
+                        if new_rows.empty:
+                            continue
+                        new_idx = new_rows.index.tolist()
 
                     for idx in new_idx:
                         df_slice = buffers[tf_name][pid].iloc[: idx + 1].copy().reset_index(drop=True)
-                        source_time = pd.to_datetime(df_slice["time"].iloc[-1], utc=True)
-                        target_time = source_time + pd.Timedelta(seconds=step_seconds)
+                        last_time = df_slice["time"].iloc[-1]
                         last_close = float(df_slice["close"].iloc[-1])
                         naive_pred = last_close
 
@@ -537,7 +450,7 @@ def run_live():
                                         online_update(bundle, df_slice)
 
                                     if DRIFT_RETRAIN_ENABLED and drift:
-                                        now = datetime.now(timezone.utc)
+                                        now = now_utc()
                                         cooldown_ok = (
                                             now - last_drift_retrain[tf_name][pid][ver]
                                         ).total_seconds() >= DRIFT_RETRAIN_COOLDOWN_HOURS * 3600
@@ -573,41 +486,26 @@ def run_live():
                             pred_close, pred_raw, pi_lo, pi_hi = predict_next(bundle, df_slice)
 
                             line = (
-                                f"{datetime.now(timezone.utc)} PRED_{ver} "
-                                f"tf={tf_name} source_time={source_time} target_time={target_time} last_close={last_close:.2f} "
-                                f"pred_next_close={pred_close:.2f} pred_raw={pred_raw:.2f} "
+                                f"engine_time_local={now_local().strftime('%Y-%m-%d %H:%M:%S %Z')} "
+                                f"engine_time_utc={now_utc().isoformat()} PRED_{ver} "
+                                f"tf={tf_name} candle_time_local={fmt_local(last_time)} "
+                                f"candle_time_utc={pd.to_datetime(last_time, utc=True).isoformat()} "
+                                f"last_close={last_close:.2f} pred_next_close={pred_close:.2f} pred_raw={pred_raw:.2f} "
                                 f"PI95=[{pi_lo:.2f},{pi_hi:.2f}] naive_next_close={naive_pred:.2f}"
                             )
-                            if ver == "v4":
-                                rv_txt = f"{bundle.last_realized_vol:.6f}" if bundle.last_realized_vol is not None and np.isfinite(bundle.last_realized_vol) else "nan"
-                                vr_txt = f"{bundle.last_vol_ratio:.3f}" if bundle.last_vol_ratio is not None and np.isfinite(bundle.last_vol_ratio) else "nan"
-                                gw_txt = f"{bundle.last_gate_fast_weight:.3f}" if bundle.last_gate_fast_weight is not None and np.isfinite(bundle.last_gate_fast_weight) else "nan"
-                                line += (
-                                    f" regime={bundle.last_regime or 'na'}"
-                                    f" rv={rv_txt}"
-                                    f" vol_ratio={vr_txt}"
-                                    f" gate_fast={gw_txt}"
-                                    f" online_mode={bundle.last_online_mode or 'na'}"
-                                )
                             print(f"[{tf_name}][{pid}] {line}")
                             append_log(ver, tf_name, pid, line)
                             append_prediction(
                                 ver,
                                 tf_name,
                                 pid,
-                                source_time,
-                                target_time,
+                                last_time,
                                 last_close,
                                 pred_close,
                                 pred_raw,
                                 pi_lo,
                                 pi_hi,
                                 naive_pred,
-                                current_regime=bundle.last_regime,
-                                realized_vol=bundle.last_realized_vol,
-                                vol_ratio=bundle.last_vol_ratio,
-                                gate_fast_weight=bundle.last_gate_fast_weight,
-                                online_mode=bundle.last_online_mode,
                             )
 
                             pred_counter[tf_name][pid][ver] += 1
@@ -619,28 +517,25 @@ def run_live():
                                         "asset": pid,
                                         "timeframe": tf_name,
                                         "version": ver,
-                                        "timestamp_utc": str(datetime.now(timezone.utc)),
+                                        "timestamp_utc": str(now_utc()),
                                         "mode": "periodic_save",
                                         "cfg": cfg.__dict__,
                                     },
                                 )
 
-                        last_processed[tf_name][pid] = source_time
-
                     # daily retrain
-                    now = datetime.now(timezone.utc)
+                    now = now_utc()
                     if (now - last_daily_retrain[tf_name][pid]).total_seconds() >= DAILY_RETRAIN_HOURS * 3600:
                         df_buf = bootstrap_last_n_public(
                             pid,
                             n=window,
-                            granularity=TIMEFRAMES[tf_name]["granularity"],
+                            granularity=granularity,
                         )
                         df_buf["time"] = pd.to_datetime(df_buf["time"], utc=True)
-                        df_buf = filter_completed_candles(df_buf, tf_name)
                         df_buf = df_buf.sort_values("time").drop_duplicates("time").reset_index(drop=True)
                         df_buf = ensure_continuity(tf_name, pid, df_buf)
                         buffers[tf_name][pid] = df_buf
-                        save_buffer(tf_name, pid, df_buf)
+                        save_buffer(tf_name, pid, buffers[tf_name][pid])
 
                         for ver in VERSIONS_ORDER:
                             cfg = CONFIGS[ver]
@@ -663,7 +558,7 @@ def run_live():
                         last_daily_retrain[tf_name][pid] = now
 
                 except Exception as e:
-                    err = f"{datetime.now(timezone.utc)} ERROR {repr(e)}"
+                    err = f"{now_utc()} ERROR {repr(e)}"
                     print(f"[{tf_name}][{pid}] {err}")
                     for ver in CONFIGS:
                         append_log(ver, tf_name, pid, err)
@@ -679,8 +574,8 @@ def run_dashboard():
 
     st.set_page_config(page_title="Crypto Forecasting Dashboard (15m / 30m / 1h)", layout="wide")
     st.title("Live Crypto Forecasting Dashboard")
-    st.caption("Timeframes: 15m, 30m, 1h | Models: V1, V2, V3, V3A, V3B, V4 | Assets: BTC, ETH, SOL")
-    st.caption("All timeframes are fetched directly from Coinbase. Metrics use source_time -> target_time alignment.")
+    st.caption("Timeframes: 15m, 30m, 1h | Models: V1, V2, V3, V3A, V3B | Assets: BTC, ETH, SOL")
+    st.caption("Internal model timing/storage stays in UTC. Dashboard timestamps are shown in Europe/London.")
 
     st_autorefresh(interval=1000, key="refresh_1s")
 
@@ -690,24 +585,22 @@ def run_dashboard():
             return None
         df = pd.read_parquet(path)
         df["time"] = pd.to_datetime(df["time"], utc=True)
-        return df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        df["time_local"] = df["time"].dt.tz_convert(DISPLAY_TZ)
+        return df
 
     def load_pred(ver: str, tf_name: str, pid: str):
         path = out_pred_path(ver, tf_name, pid)
         if not os.path.exists(path):
             return None
         df = pd.read_csv(path)
-        if "time" in df.columns:
-            df["time"] = pd.to_datetime(df["time"], utc=True)
-        if "target_time" in df.columns:
-            df["target_time"] = pd.to_datetime(df["target_time"], utc=True)
-        for col in ["pred_next_close_raw", "pi95_lower", "pi95_upper", "realized_vol", "vol_ratio", "gate_fast_weight"]:
+        df["time"] = pd.to_datetime(df["time"], utc=True)
+        for col in ["pred_next_close_raw", "pi95_lower", "pi95_upper"]:
             if col not in df.columns:
                 df[col] = np.nan
-        for col in ["current_regime", "online_mode"]:
-            if col not in df.columns:
-                df[col] = ""
-        return df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        df = df.sort_values("time").drop_duplicates("time").reset_index(drop=True)
+        df["time_local"] = df["time"].dt.tz_convert(DISPLAY_TZ)
+        return df
 
     def safe_corr(a, b):
         a = np.asarray(a, dtype=float)
@@ -725,10 +618,8 @@ def run_dashboard():
         bc = b - float(np.mean(b))
         return float(np.sum(ac * bc) / ((len(a) - 1) * sa * sb))
 
-    def compute_metrics(df_join: pd.DataFrame, pred_col: str, regime: str | None = None):
+    def compute_metrics(df_join: pd.DataFrame, pred_col: str):
         valid = df_join.dropna(subset=["actual_next_close"]).copy()
-        if regime is not None and "current_regime" in valid.columns:
-            valid = valid[valid["current_regime"] == regime].copy()
         if len(valid) < 20:
             return None
 
@@ -763,6 +654,7 @@ def run_dashboard():
             last_n = 200
             pred_points = 2000
 
+            # KPI row
             st.markdown("### Latest Snapshot")
             cols = st.columns(3)
             for i, pid in enumerate(PRODUCT_IDS):
@@ -772,22 +664,17 @@ def run_dashboard():
                     if df_raw is None or df_raw.empty:
                         st.warning("No raw data yet. Run engine (`python app.py`).")
                         continue
-                    st.write(f"Last completed source time: {df_raw['time'].iloc[-1]}")
+                    st.write(f"Last time (UK): {df_raw['time_local'].iloc[-1]}")
+                    st.caption(f"Last time (UTC): {df_raw['time'].iloc[-1]}")
                     st.metric("Actual close", f"{float(df_raw['close'].iloc[-1]):.2f}")
                     for ver in VERSIONS_ORDER:
                         dfp = pred_data[pid].get(ver)
                         if dfp is not None and not dfp.empty:
                             st.metric(f"{ver.upper()} next close", f"{float(dfp['pred_next_close'].iloc[-1]):.2f}")
-                            if ver == "v4":
-                                reg = str(dfp["current_regime"].iloc[-1]) if "current_regime" in dfp.columns else ""
-                                rv = float(dfp["realized_vol"].iloc[-1]) if "realized_vol" in dfp.columns and np.isfinite(dfp["realized_vol"].iloc[-1]) else np.nan
-                                mode = str(dfp["online_mode"].iloc[-1]) if "online_mode" in dfp.columns else ""
-                                st.caption(f"V4 regime: {reg or 'na'} | RV: {rv:.6f}" if np.isfinite(rv) else f"V4 regime: {reg or 'na'} | RV: na")
-                                if mode:
-                                    st.caption(f"V4 update mode: {mode}")
                         else:
                             st.caption(f"{ver.upper()} no predictions yet.")
 
+            # OHLC row
             st.markdown(f"### OHLC Candlesticks (last {last_n})")
             cols_ohlc = st.columns(3)
             for i, pid in enumerate(PRODUCT_IDS):
@@ -801,7 +688,7 @@ def run_dashboard():
                     fig = go.Figure(
                         data=[
                             go.Candlestick(
-                                x=df_view["time"],
+                                x=df_view["time_local"],
                                 open=df_view["open"],
                                 high=df_view["high"],
                                 low=df_view["low"],
@@ -813,6 +700,7 @@ def run_dashboard():
                     fig.update_layout(height=420, margin=dict(l=10, r=10, t=20, b=10), xaxis_rangeslider_visible=False)
                     st.plotly_chart(fig, use_container_width=True)
 
+            # Prediction row
             st.markdown(f"### Predicted vs Actual (last {pred_points}) — {tf_name}")
             cols_pred = st.columns(3)
 
@@ -825,8 +713,9 @@ def run_dashboard():
                         st.warning("No raw data yet.")
                         continue
 
-                    actual_map = df_raw[["time", "close"]].copy().sort_values("time")
-                    actual_map.rename(columns={"time": "target_time", "close": "actual_next_close"}, inplace=True)
+                    df_actual = df_raw[["time", "close"]].copy().sort_values("time")
+                    df_actual.rename(columns={"close": "actual_close"}, inplace=True)
+                    df_actual["actual_next_close"] = df_actual["actual_close"].shift(-1)
 
                     for ver in VERSIONS_ORDER:
                         dfp = pred_data[pid].get(ver)
@@ -835,22 +724,17 @@ def run_dashboard():
                             continue
 
                         dfp = dfp.iloc[-pred_points:].copy()
-                        if "target_time" in dfp.columns:
-                            df_join = pd.merge(dfp, actual_map, on="target_time", how="left")
-                        else:
-                            df_actual = df_raw[["time", "close"]].copy().sort_values("time")
-                            df_actual.rename(columns={"close": "actual_close"}, inplace=True)
-                            df_actual["actual_next_close"] = df_actual["actual_close"].shift(-1)
-                            df_join = pd.merge(dfp, df_actual[["time", "actual_next_close"]], on="time", how="left")
+                        df_join = pd.merge(dfp, df_actual, on="time", how="left")
 
                         fig2 = go.Figure()
-                        fig2.add_trace(go.Scatter(x=df_join["time"], y=df_join["actual_next_close"], mode="lines", name="Actual next close"))
-                        fig2.add_trace(go.Scatter(x=df_join["time"], y=df_join["pred_next_close"], mode="lines", name=f"{ver.upper()} pred"))
-                        fig2.add_trace(go.Scatter(x=df_join["time"], y=df_join["naive_next_close"], mode="lines", name="Naive"))
+                        x_display = df_join["time"].dt.tz_convert(DISPLAY_TZ)
+                        fig2.add_trace(go.Scatter(x=x_display, y=df_join["actual_next_close"], mode="lines", name="Actual next close"))
+                        fig2.add_trace(go.Scatter(x=x_display, y=df_join["pred_next_close"], mode="lines", name=f"{ver.upper()} pred"))
+                        fig2.add_trace(go.Scatter(x=x_display, y=df_join["naive_next_close"], mode="lines", name="Naive"))
 
                         if df_join["pi95_lower"].notna().any() and df_join["pi95_upper"].notna().any():
-                            fig2.add_trace(go.Scatter(x=df_join["time"], y=df_join["pi95_upper"], mode="lines", name="PI95% upper"))
-                            fig2.add_trace(go.Scatter(x=df_join["time"], y=df_join["pi95_lower"], mode="lines", name="PI95% lower"))
+                            fig2.add_trace(go.Scatter(x=x_display, y=df_join["pi95_upper"], mode="lines", name="PI95% upper"))
+                            fig2.add_trace(go.Scatter(x=x_display, y=df_join["pi95_lower"], mode="lines", name="PI95% lower"))
 
                         fig2.update_layout(height=300, margin=dict(l=10, r=10, t=20, b=10))
                         st.markdown(f"**{ver.upper()}**")
@@ -859,27 +743,10 @@ def run_dashboard():
                         m_model = compute_metrics(df_join, "pred_next_close")
                         m_naive = compute_metrics(df_join, "naive_next_close")
                         if m_model and m_naive:
-                            extra = ""
-                            if "current_regime" in df_join.columns and df_join["current_regime"].astype(str).str.len().gt(0).any():
-                                m_low = compute_metrics(df_join, "pred_next_close", regime="low")
-                                m_high = compute_metrics(df_join, "pred_next_close", regime="high")
-                                parts = []
-                                if m_low:
-                                    parts.append(
-                                        f"LowVol → MAE: {m_low[0]:.3f} | RMSE: {m_low[1]:.3f} | DirAcc: {m_low[3]:.3f}"
-                                    )
-                                if m_high:
-                                    parts.append(
-                                        f"HighVol → MAE: {m_high[0]:.3f} | RMSE: {m_high[1]:.3f} | DirAcc: {m_high[3]:.3f}"
-                                    )
-                                if parts:
-                                    extra = "\n\n" + "\n".join(parts)
-
                             st.write(
                                 f"**{ver.upper()} Model** → MAE: {m_model[0]:.3f} | RMSE: {m_model[1]:.3f} | MAPE: {m_model[2]:.4f}\n\n"
                                 f"**Naive** → MAE: {m_naive[0]:.3f} | RMSE: {m_naive[1]:.3f} | MAPE: {m_naive[2]:.4f}\n\n"
                                 f"DirAcc: {m_model[3]:.3f} | Corr(r): {m_model[4]:.3f}"
-                                f"{extra}"
                             )
                         else:
                             st.caption("Metrics need ~20+ aligned points.")
